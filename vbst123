@@ -1,95 +1,324 @@
-CREATE OR REPLACE VIEW V_SUBMISSION_RESOURCE_DETAIL AS
-SELECT
-    DATE(START_TIME)                  AS START_DATE,
-    RESOURCE_TYPE,
-    DAYNAME(DATE(START_TIME))         AS DAY,
-    IFF(SUM(IFF(STATUS = 'ERROR', 1, 0)) > 0, 'ERROR', 'COMPLETED') AS STATUS,
-    ROUND(DATEDIFF('second', MIN(START_TIME), MAX(END_TIME)) / 3600.0, 2) AS PROCESSING_TIME_HOURS,
-    IFF(DATEDIFF('second', MIN(START_TIME), MAX(END_TIME)) > 0,
-        ROUND(SUM(TOTAL_COUNT) / (DATEDIFF('second', MIN(START_TIME), MAX(END_TIME)) / 3600.0), 0),
-        NULL)                          AS PROCESSING_RATE,
-    SUM(SUCCESS_COUNT)                 AS ACCEPTED,
-    SUM(FAILURE_COUNT)                 AS REJECTED,
-    SUM(TOTAL_COUNT)                   AS TOTAL,
-    IFF(SUM(TOTAL_COUNT) > 0, ROUND(SUM(SUCCESS_COUNT) / SUM(TOTAL_COUNT), 4), NULL) AS ACCEPTED_PCT
-FROM PDT_SUBMISSION_JOB_SUMMARY
-GROUP BY DATE(START_TIME), RESOURCE_TYPE
-ORDER BY START_DATE;
+{#- ======================================================================
+    archive_historical_records
+    ----------------------------------------------------------------------
+    Moves old rows from each active table in the archive config into
+    <table>_ARCHIVE, unloads that batch to stage as Parquet, then deletes
+    the rows from the source table - all inside one transaction per table.
+
+    Environment-agnostic: no database names live in this package.
+    The consuming project supplies them as vars:
+      archive_metadata_db     (default: target.database)
+      archive_metadata_schema (default: METADATA)
+      archive_stage_root      (required, full @stage/path)
+
+    Usage:
+      dbt run-operation archive_historical_records --args '{"archive_date": "202001"}'
+      dbt run-operation archive_historical_records --args '{"archive_date": "202001", "table_name": "HCP_BOARD_CERTIFICATION"}'
+      dbt run-operation archive_historical_records --args '{"archive_date": "202001", "dry_run": true}'
+    ====================================================================== -#}
+
+{% macro archive_historical_records(
+        archive_date,
+        config_table=none,
+        table_name=none,
+        months_to_archive=60,
+        ts_column='INSRT_TS',
+        dry_run=false
+    ) %}
+
+    {#----------------------------------------------------------------------#}
+    {# 1. Validate input                                                    #}
+    {#----------------------------------------------------------------------#}
+
+    {% set archive_date = archive_date | string %}
+    {% if not modules.re.match('^[0-9]{4}(0[1-9]|1[0-2])$', archive_date) %}
+        {{ exceptions.raise_compiler_error(
+            "archive_date must be in YYYYMM format, got: '" ~ archive_date ~ "'") }}
+    {% endif %}
+
+    {#----------------------------------------------------------------------#}
+    {# 2. Environment-specific names (resolved per dbt Cloud environment)   #}
+    {#----------------------------------------------------------------------#}
+
+    {# Defined in the CONSUMING project's dbt_project.yml (or --vars), never here #}
+    {% set meta_db     = var('archive_metadata_db', target.database) | upper %}
+    {% set meta_schema = var('archive_metadata_schema', 'METADATA') | upper %}
+    {% set stage_root  = var('archive_stage_root', none) %}
+
+    {% if not stage_root %}
+        {{ exceptions.raise_compiler_error(
+            "var 'archive_stage_root' is not set. Define it in your project's dbt_project.yml, "
+            ~ "e.g. archive_stage_root: '@EC_INGEST_RAW_DEV1.RAW.STG_EXT_RAW1/internal/data/FAD/Archive'") }}
+    {% endif %}
+
+    {% set config_table  = config_table or (meta_db ~ '.' ~ meta_schema ~ '.ARCHIVE_CONFIG') %}
+    {% set run_log_table = meta_db ~ '.' ~ meta_schema ~ '.ARCHIVE_RUN_LOG' %}
+
+    {#----------------------------------------------------------------------#}
+    {# 3. Batch ID + archive window                                         #}
+    {#    Window: [archive_date-01, least(start + N months, current month)) #}
+    {#    Never touches the current month.                                  #}
+    {#----------------------------------------------------------------------#}
+
+    {% set archive_batch_id =
+            archive_date ~ '_'
+         ~ modules.datetime.datetime.now().strftime('%Y%m%d%H%M%S') ~ '_'
+         ~ invocation_id[:8] %}
+
+    {% set start_dt_sql = "to_date('" ~ archive_date ~ "01', 'YYYYMMDD')" %}
+    {% set end_excl_sql =
+            "least(add_months(" ~ start_dt_sql ~ ", " ~ months_to_archive ~ "), "
+         ~ "date_trunc('month', current_date()))" %}
+
+    {% set range_filter %}
+        {{ ts_column }} >= {{ start_dt_sql }}
+    and {{ ts_column }} <  {{ end_excl_sql }}
+    {% endset %}
+
+    {{ log('==================================================================', info=True) }}
+    {{ log('Archive run    : ' ~ archive_batch_id ~ (' [DRY RUN]' if dry_run else ''), info=True) }}
+    {{ log('Target / DB    : ' ~ target.name ~ ' / ' ~ target.database, info=True) }}
+    {{ log('Config table   : ' ~ config_table, info=True) }}
+    {{ log('Run log table  : ' ~ run_log_table, info=True) }}
+    {{ log('Stage root     : ' ~ stage_root, info=True) }}
+    {{ log('==================================================================', info=True) }}
+
+    {#----------------------------------------------------------------------#}
+    {# 4. Read config                                                       #}
+    {#----------------------------------------------------------------------#}
+
+    {% set config_sql %}
+        select
+            coalesce(database_name, '{{ target.database | upper }}') as database_name,
+            schema_name,
+            table_name
+        from {{ config_table }}
+        where active_flg = 'Y'
+        {% if table_name %}
+          and upper(table_name) = upper({{ _arch_str(table_name) }})
+        {% endif %}
+        order by table_name
+    {% endset %}
+
+    {% set config_rows = run_query(config_sql).rows %}
+
+    {% if config_rows | length == 0 %}
+        {{ log('No active tables found in ' ~ config_table
+               ~ (' for ' ~ table_name if table_name else '') ~ '. Nothing to do.', info=True) }}
+        {{ return(none) }}
+    {% endif %}
+
+    {% set ns = namespace(success=0, no_data=0, failed=0, failed_tables=[]) %}
+
+    {#----------------------------------------------------------------------#}
+    {# 5. Process each table                                                #}
+    {#----------------------------------------------------------------------#}
+
+    {% for row in config_rows %}
+
+        {% set database_name = row[0] | upper %}
+        {% set schema_name   = row[1] | upper %}
+        {% set source_table  = row[2] | upper %}
+
+        {% set src_table     = database_name ~ '.' ~ schema_name ~ '.' ~ source_table %}
+        {% set archive_table = src_table ~ '_ARCHIVE' %}
+        {# batch_id in the path: a rolled-back attempt never collides with a rerun #}
+        {% set archive_stage = stage_root ~ '/' ~ schema_name ~ '/' ~ source_table
+                               ~ '/' ~ archive_date ~ '/' ~ archive_batch_id ~ '/' %}
+
+        {{ log('[' ~ loop.index ~ '/' ~ loop.length ~ '] Processing : ' ~ src_table, info=True) }}
+
+        {# ---- Count rows in archive window ---- #}
+        {% set source_cnt = run_query(
+                "select count(*) from " ~ src_table ~ " where " ~ range_filter
+            ).rows[0][0] %}
+
+        {{ log('    Rows in window : ' ~ source_cnt, info=True) }}
+
+        {% if source_cnt == 0 %}
+
+            {% do _log_archive_run(run_log_table, database_name, schema_name, source_table,
+                                   archive_date, archive_batch_id, 0, 'NO_DATA', none, dry_run) %}
+            {% set ns.no_data = ns.no_data + 1 %}
+
+        {% elif dry_run %}
+
+            {{ log('    [DRY RUN] would archive ' ~ source_cnt ~ ' rows -> '
+                   ~ archive_table ~ ' and unload to ' ~ archive_stage, info=True) }}
+
+        {% else %}
+
+            {# ---- DDL first: Snowflake DDL auto-commits, so keep it outside the transaction ---- #}
+            {% do run_query('create table if not exists ' ~ archive_table ~ ' like ' ~ src_table) %}
+            {% for ddl_col in ['ARCHIVE_DATE varchar(6)',
+                               'ARCHIVE_RUN_TS timestamp_ntz',
+                               'ARCHIVE_BATCH_ID varchar'] %}
+                {% do run_query('alter table ' ~ archive_table
+                                ~ ' add column if not exists ' ~ ddl_col) %}
+            {% endfor %}
+
+            {% set archive_insert_sql %}
+                insert into {{ archive_table }}
+                select
+                    s.*,
+                    '{{ archive_date }}',
+                    current_timestamp(),
+                    '{{ archive_batch_id }}'
+                from {{ src_table }} s
+                where s.{{ ts_column }} >= {{ start_dt_sql }}
+                  and s.{{ ts_column }} <  {{ end_excl_sql }}
+                  and not exists (
+                        select 1
+                        from {{ archive_table }} a
+                        where a.{{ ts_column }} = s.{{ ts_column }}
+                          and a.ARCHIVE_DATE    = '{{ archive_date }}'
+                  )
+            {% endset %}
+
+            {% set unload_sql %}
+                copy into {{ archive_stage }}
+                from (
+                    select *
+                    from {{ archive_table }}
+                    where ARCHIVE_BATCH_ID = '{{ archive_batch_id }}'
+                )
+                file_format = (type = parquet compression = snappy)
+                header      = true
+                overwrite   = false
+            {% endset %}
+
+            {% set delete_sql %}
+                delete from {{ src_table }}
+                where {{ range_filter }}
+            {% endset %}
+
+            {% set t = namespace(status='SUCCESS', error_msg=none, archived_cnt=0) %}
+
+            {# ---------------- transaction ---------------- #}
+            {% do run_query('begin') %}
+
+            {% do run_query(archive_insert_sql) %}
+            {% set t.archived_cnt = run_query(
+                    "select count(*) from " ~ archive_table
+                    ~ " where ARCHIVE_BATCH_ID = '" ~ archive_batch_id ~ "'"
+                ).rows[0][0] %}
+
+            {% if t.archived_cnt != source_cnt %}
+                {% set t.status    = 'FAILED' %}
+                {% set t.error_msg = 'Archive count mismatch: source=' ~ source_cnt
+                                     ~ ', archived=' ~ t.archived_cnt %}
+            {% else %}
+
+                {% set unload_rows = run_query(unload_sql).rows %}
+                {% set unloaded_cnt = unload_rows[0][0] if unload_rows | length > 0 else 0 %}
+
+                {% if unloaded_cnt != t.archived_cnt %}
+                    {% set t.status    = 'FAILED' %}
+                    {% set t.error_msg = 'Stage unload mismatch: archived=' ~ t.archived_cnt
+                                         ~ ', unloaded=' ~ unloaded_cnt
+                                         ~ ' (path: ' ~ archive_stage ~ ')' %}
+                {% else %}
+
+                    {% set deleted_cnt = run_query(delete_sql).rows[0][0] %}
+
+                    {% if deleted_cnt != source_cnt %}
+                        {% set t.status    = 'FAILED' %}
+                        {% set t.error_msg = 'Delete count mismatch: source=' ~ source_cnt
+                                             ~ ', deleted=' ~ deleted_cnt %}
+                    {% endif %}
+
+                {% endif %}
+            {% endif %}
+
+            {% if t.status == 'SUCCESS' %}
+                {% do run_query('commit') %}
+                {% set ns.success = ns.success + 1 %}
+                {{ log('    SUCCESS : ' ~ t.archived_cnt ~ ' rows archived, unloaded and deleted', info=True) }}
+            {% else %}
+                {% do run_query('rollback') %}
+                {% set ns.failed = ns.failed + 1 %}
+                {% do ns.failed_tables.append(src_table) %}
+                {{ log('    FAILED  : ' ~ t.error_msg, info=True) }}
+            {% endif %}
+            {# -------------- end transaction -------------- #}
+
+            {% do _log_archive_run(run_log_table, database_name, schema_name, source_table,
+                                   archive_date, archive_batch_id,
+                                   t.archived_cnt if t.status == 'SUCCESS' else 0,
+                                   t.status, t.error_msg, dry_run) %}
+
+        {% endif %}
+
+    {% endfor %}
+
+    {#----------------------------------------------------------------------#}
+    {# 6. Summary - fail the job if any table failed                        #}
+    {#----------------------------------------------------------------------#}
+
+    {{ log('==================================================================', info=True) }}
+    {{ log('Summary  -> success: ' ~ ns.success ~ ' | no_data: ' ~ ns.no_data
+           ~ ' | failed: ' ~ ns.failed, info=True) }}
+    {{ log('==================================================================', info=True) }}
+
+    {% if ns.failed > 0 %}
+        {{ exceptions.raise_compiler_error(
+            'Archive failed for ' ~ ns.failed ~ ' table(s): ' ~ (ns.failed_tables | join(', '))
+            ~ '. See ' ~ run_log_table ~ " where ARCHIVE_BATCH_ID = '" ~ archive_batch_id ~ "'") }}
+    {% endif %}
+
+{% endmacro %}
 
 
-CREATE OR REPLACE VIEW V_TERMINATING_PROVIDER_SUMMARY AS
-WITH parsed AS (
-    SELECT
-        TASK_DATE,
-        START_TIME,
-        END_TIME,
-        PRACTITIONER_ROLE_COUNT,
-        ORGANIZATION_AFFILIATION_COUNT,
-        TO_DATE(
-            LEFT(REGEXP_SUBSTR(SRC_FILENAME, '_([0-9]{14})\\.txt$', 1, 1, 'e', 1), 8),
-            'YYYYMMDD'
-        ) AS RUN_DATE
-    FROM PDT_TERMINATING_PROVIDER_RETRIEVE_JOB_SUMMARY
-)
-SELECT
-    TASK_DATE                         AS RESOURCE_UPDATE_DATE,
-    MAX(RUN_DATE)                     AS RUN_DATE,
-    DAYNAME(MAX(RUN_DATE))            AS DAY,
-    ROUND(SUM(DATEDIFF('second', START_TIME, END_TIME)) / 60.0, 0) AS PROCESSING_TIME_MINUTES,
-    SUM(PRACTITIONER_ROLE_COUNT)      AS PRACTITIONER_ROLE,
-    SUM(ORGANIZATION_AFFILIATION_COUNT) AS ORGANIZATION_AFFILIATION,
-    SUM(PRACTITIONER_ROLE_COUNT) + SUM(ORGANIZATION_AFFILIATION_COUNT) AS TOTALS
-FROM parsed
-GROUP BY TASK_DATE
-ORDER BY TASK_DATE;
+{#- ----------------------------------------------------------------------
+    Helper: write one row to ARCHIVE_RUN_LOG (skipped on dry run)
+    ---------------------------------------------------------------------- -#}
+{% macro _log_archive_run(run_log_table, database_name, schema_name, table_name,
+                          archive_date, archive_batch_id, rows_archived,
+                          status, error_msg=none, dry_run=false) %}
+
+    {% if dry_run %}
+        {{ return(none) }}
+    {% endif %}
+
+    {% set audit_sql %}
+        insert into {{ run_log_table }}
+        (
+            RUN_TS,
+            DATABASE_NAME,
+            SCHEMA_NAME,
+            TABLE_NAME,
+            ARCHIVE_DATE,
+            ARCHIVE_BATCH_ID,
+            ROWS_ARCHIVED,
+            STATUS,
+            ERROR_MESSAGE
+        )
+        values
+        (
+            current_timestamp(),
+            {{ _arch_str(database_name) }},
+            {{ _arch_str(schema_name) }},
+            {{ _arch_str(table_name) }},
+            {{ _arch_str(archive_date) }},
+            {{ _arch_str(archive_batch_id) }},
+            {{ rows_archived | int }},
+            {{ _arch_str(status) }},
+            {{ _arch_str(error_msg) }}
+        )
+    {% endset %}
+
+    {% do run_query(audit_sql) %}
+
+{% endmacro %}
 
 
-CREATE OR REPLACE VIEW V_NOT_YET_PROCESSED_BY_BCBSA AS
-WITH parsed AS (
-    SELECT
-        RESOURCE_TYPE,
-        RESOURCE_ID,
-        CONSUMPTION_AVAILABLE_TIMESTAMP        AS SUBMISSION_TIMESTAMP,
-        TO_TIMESTAMP(
-            REGEXP_SUBSTR(SRC_FILENAME, '_([0-9]{14})_', 1, 1, 'e', 1),
-            'YYYYMMDDHH24MISS'
-        ) AS VALIDATION_RUN_TIME
-    FROM PDT_REPORTING_ANALYTICS_CONSUMPTION
-),
-last_run AS (
-    SELECT RESOURCE_TYPE, MAX(VALIDATION_RUN_TIME) AS LAST_VALIDATION_RUN
-    FROM parsed
-    GROUP BY RESOURCE_TYPE
-),
-aged AS (
-    SELECT
-        p.RESOURCE_TYPE,
-        p.RESOURCE_ID,
-        p.SUBMISSION_TIMESTAMP,
-        lr.LAST_VALIDATION_RUN,
-        DATEDIFF('second', p.SUBMISSION_TIMESTAMP, lr.LAST_VALIDATION_RUN) / 3600.0 AS AGING_HOURS
-    FROM parsed p
-    JOIN last_run lr ON p.RESOURCE_TYPE = lr.RESOURCE_TYPE
-)
-SELECT
-    RESOURCE_TYPE,
-    RESOURCE_ID,
-    SUBMISSION_TIMESTAMP,
-    LAST_VALIDATION_RUN,
-    ROUND(AGING_HOURS, 2)                       AS AGING_HOURS,
-    CASE
-        WHEN AGING_HOURS <= 2   THEN '0-2 Hours'
-        WHEN AGING_HOURS <= 12  THEN '2-12 Hours'
-        WHEN AGING_HOURS <= 24  THEN '12-24 Hours'
-        WHEN AGING_HOURS <= 168 THEN '1-7 Days'
-        ELSE '7+ Days'
-    END                                          AS AGING_BUCKET
-FROM aged
-WHERE AGING_HOURS > 2   -- past SLA, hence "not yet processed"
-   OR SUBMISSION_TIMESTAMP IS NULL
-ORDER BY RESOURCE_TYPE, AGING_HOURS DESC;
-
-
-
-
-
+{#- ----------------------------------------------------------------------
+    Helper: render a value as a safe SQL string literal (or null)
+    ---------------------------------------------------------------------- -#}
+{% macro _arch_str(val) -%}
+    {%- if val is none or (val | string | trim) == '' -%}
+        null
+    {%- else -%}
+        '{{ val | string | replace("'", "''") }}'
+    {%- endif -%}
+{%- endmacro %}
