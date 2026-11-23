@@ -12,8 +12,8 @@
     Environment-agnostic: database/schema names come from the consuming
     project's dbt_project.yml vars (already resolved per target.name):
       tgt_database, tgt_schema        -> archive tables
-      recon_database, recon_schema    -> ARCHIVE_RUN_LOG
-      archive_config_table (optional) -> default <tgt_database>.METADATA.ARCHIVE_CONFIG
+      recon_database, recon_schema    -> ARCHIVE_CONFIG and ARCHIVE_RUN_LOG
+    (config_table arg can still override the config location for one run)
 
     archive_date: YYYYMMDD - the archive window starts on that day
 
@@ -53,9 +53,8 @@
     {% set recon_db    = _arch_var('recon_database') %}
     {% set recon_schema = _arch_var('recon_schema') %}
 
-    {% set config_table  = config_table
-                           or var('archive_config_table', none)
-                           or (tgt_db ~ '.METADATA.ARCHIVE_CONFIG') %}
+    {# Both control tables live in the recon database/schema #}
+    {% set config_table  = config_table or (recon_db ~ '.' ~ recon_schema ~ '.ARCHIVE_CONFIG') %}
     {% set run_log_table = recon_db ~ '.' ~ recon_schema ~ '.ARCHIVE_RUN_LOG' %}
 
     {#----------------------------------------------------------------------#}
@@ -332,7 +331,8 @@
 {%- endmacro %}
 
 
-create table if not exists EC_FAD_IM_DEV1.METADATA.ARCHIVE_CONFIG
+
+create table if not exists EC_METRIC_IM_DEV1.RECON.ARCHIVE_CONFIG.ARCHIVE_CONFIG
 (
     CONFIG_ID       number autoincrement start 1 increment 1,
     DATABASE_NAME   varchar(255),                  -- null = falls back to tgt_database
