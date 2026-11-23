@@ -1,20 +1,26 @@
 {#- ======================================================================
     archive_historical_records
     ----------------------------------------------------------------------
-    Moves old rows from each active table in the archive config into
-    <table>_ARCHIVE, unloads that batch to stage as Parquet, then deletes
-    the rows from the source table - all inside one transaction per table.
+    For each active table in the archive config:
+      1. Copies rows in the archive window into
+         <tgt_database>.<tgt_schema>.<table>_ARCHIVE
+      2. Validates the archived count
+      3. Deletes those rows from the source table
+    Steps 1-3 run in one transaction per table; any mismatch rolls back.
+    Every table gets a row in <recon_database>.<recon_schema>.ARCHIVE_RUN_LOG.
 
-    Environment-agnostic: no database names live in this package.
-    The consuming project supplies them as vars:
-      archive_metadata_db     (default: target.database)
-      archive_metadata_schema (default: METADATA)
-      archive_stage_root      (required, full @stage/path)
+    Environment-agnostic: database/schema names come from the consuming
+    project's dbt_project.yml vars (already resolved per target.name):
+      tgt_database, tgt_schema        -> archive tables
+      recon_database, recon_schema    -> ARCHIVE_RUN_LOG
+      archive_config_table (optional) -> default <tgt_database>.METADATA.ARCHIVE_CONFIG
+
+    archive_date: YYYYMMDD - the archive window starts on that day
 
     Usage:
-      dbt run-operation archive_historical_records --args '{"archive_date": "202001"}'
-      dbt run-operation archive_historical_records --args '{"archive_date": "202001", "table_name": "HCP_BOARD_CERTIFICATION"}'
-      dbt run-operation archive_historical_records --args '{"archive_date": "202001", "dry_run": true}'
+      dbt run-operation archive_historical_records --args '{"archive_date": "20200101"}'
+      dbt run-operation archive_historical_records --args '{"archive_date": "20200101", "table_name": "HCP_BOARD_CERTIFICATION"}'
+      dbt run-operation archive_historical_records --args '{"archive_date": "20200101", "dry_run": true}'
     ====================================================================== -#}
 
 {% macro archive_historical_records(
@@ -30,33 +36,31 @@
     {# 1. Validate input                                                    #}
     {#----------------------------------------------------------------------#}
 
-    {% set archive_date = archive_date | string %}
-    {% if not modules.re.match('^[0-9]{4}(0[1-9]|1[0-2])$', archive_date) %}
+    {% set archive_date = archive_date | string | trim %}
+    {% if not modules.re.match('^[0-9]{4}(0[1-9]|1[0-2])(0[1-9]|[12][0-9]|3[01])$', archive_date) %}
         {{ exceptions.raise_compiler_error(
-            "archive_date must be in YYYYMM format, got: '" ~ archive_date ~ "'") }}
+            "archive_date must be YYYYMMDD (e.g. 20200115), got: '" ~ archive_date ~ "'") }}
     {% endif %}
+    {# reject impossible dates like 20230231 #}
+    {% set _ = modules.datetime.datetime.strptime(archive_date, '%Y%m%d') %}
 
     {#----------------------------------------------------------------------#}
-    {# 2. Environment-specific names (resolved per dbt Cloud environment)   #}
+    {# 2. Environment-specific names from project vars                      #}
     {#----------------------------------------------------------------------#}
 
-    {# Defined in the CONSUMING project's dbt_project.yml (or --vars), never here #}
-    {% set meta_db     = var('archive_metadata_db', target.database) | upper %}
-    {% set meta_schema = var('archive_metadata_schema', 'METADATA') | upper %}
-    {% set stage_root  = var('archive_stage_root', none) %}
+    {% set tgt_db      = _arch_var('tgt_database') %}
+    {% set tgt_schema  = _arch_var('tgt_schema') %}
+    {% set recon_db    = _arch_var('recon_database') %}
+    {% set recon_schema = _arch_var('recon_schema') %}
 
-    {% if not stage_root %}
-        {{ exceptions.raise_compiler_error(
-            "var 'archive_stage_root' is not set. Define it in your project's dbt_project.yml, "
-            ~ "e.g. archive_stage_root: '@EC_INGEST_RAW_DEV1.RAW.STG_EXT_RAW1/internal/data/FAD/Archive'") }}
-    {% endif %}
-
-    {% set config_table  = config_table or (meta_db ~ '.' ~ meta_schema ~ '.ARCHIVE_CONFIG') %}
-    {% set run_log_table = meta_db ~ '.' ~ meta_schema ~ '.ARCHIVE_RUN_LOG' %}
+    {% set config_table  = config_table
+                           or var('archive_config_table', none)
+                           or (tgt_db ~ '.METADATA.ARCHIVE_CONFIG') %}
+    {% set run_log_table = recon_db ~ '.' ~ recon_schema ~ '.ARCHIVE_RUN_LOG' %}
 
     {#----------------------------------------------------------------------#}
     {# 3. Batch ID + archive window                                         #}
-    {#    Window: [archive_date-01, least(start + N months, current month)) #}
+    {#    [start, least(start + N months, first day of current month))      #}
     {#    Never touches the current month.                                  #}
     {#----------------------------------------------------------------------#}
 
@@ -65,7 +69,7 @@
          ~ modules.datetime.datetime.now().strftime('%Y%m%d%H%M%S') ~ '_'
          ~ invocation_id[:8] %}
 
-    {% set start_dt_sql = "to_date('" ~ archive_date ~ "01', 'YYYYMMDD')" %}
+    {% set start_dt_sql = "to_date('" ~ archive_date ~ "', 'YYYYMMDD')" %}
     {% set end_excl_sql =
             "least(add_months(" ~ start_dt_sql ~ ", " ~ months_to_archive ~ "), "
          ~ "date_trunc('month', current_date()))" %}
@@ -77,10 +81,10 @@
 
     {{ log('==================================================================', info=True) }}
     {{ log('Archive run    : ' ~ archive_batch_id ~ (' [DRY RUN]' if dry_run else ''), info=True) }}
-    {{ log('Target / DB    : ' ~ target.name ~ ' / ' ~ target.database, info=True) }}
+    {{ log('Target name    : ' ~ target.name, info=True) }}
     {{ log('Config table   : ' ~ config_table, info=True) }}
+    {{ log('Archive tables : ' ~ tgt_db ~ '.' ~ tgt_schema ~ '.<table>_ARCHIVE', info=True) }}
     {{ log('Run log table  : ' ~ run_log_table, info=True) }}
-    {{ log('Stage root     : ' ~ stage_root, info=True) }}
     {{ log('==================================================================', info=True) }}
 
     {#----------------------------------------------------------------------#}
@@ -89,7 +93,7 @@
 
     {% set config_sql %}
         select
-            coalesce(database_name, '{{ target.database | upper }}') as database_name,
+            coalesce(database_name, '{{ tgt_db }}') as database_name,
             schema_name,
             table_name
         from {{ config_table }}
@@ -120,13 +124,11 @@
         {% set schema_name   = row[1] | upper %}
         {% set source_table  = row[2] | upper %}
 
-        {% set src_table     = database_name ~ '.' ~ schema_name ~ '.' ~ source_table %}
-        {% set archive_table = src_table ~ '_ARCHIVE' %}
-        {# batch_id in the path: a rolled-back attempt never collides with a rerun #}
-        {% set archive_stage = stage_root ~ '/' ~ schema_name ~ '/' ~ source_table
-                               ~ '/' ~ archive_date ~ '/' ~ archive_batch_id ~ '/' %}
+        {% set src_table          = database_name ~ '.' ~ schema_name ~ '.' ~ source_table %}
+        {% set archive_table_name = source_table ~ '_ARCHIVE' %}
+        {% set archive_table      = tgt_db ~ '.' ~ tgt_schema ~ '.' ~ archive_table_name %}
 
-        {{ log('[' ~ loop.index ~ '/' ~ loop.length ~ '] Processing : ' ~ src_table, info=True) }}
+        {{ log('[' ~ loop.index ~ '/' ~ loop.length ~ '] ' ~ src_table ~ '  ->  ' ~ archive_table, info=True) }}
 
         {# ---- Count rows in archive window ---- #}
         {% set source_cnt = run_query(
@@ -143,19 +145,31 @@
 
         {% elif dry_run %}
 
-            {{ log('    [DRY RUN] would archive ' ~ source_cnt ~ ' rows -> '
-                   ~ archive_table ~ ' and unload to ' ~ archive_stage, info=True) }}
+            {{ log('    [DRY RUN] would archive and delete ' ~ source_cnt ~ ' rows', info=True) }}
 
         {% else %}
 
             {# ---- DDL first: Snowflake DDL auto-commits, so keep it outside the transaction ---- #}
             {% do run_query('create table if not exists ' ~ archive_table ~ ' like ' ~ src_table) %}
-            {% for ddl_col in ['ARCHIVE_DATE varchar(6)',
+            {% for ddl_col in ['ARCHIVE_DATE varchar(8)',
                                'ARCHIVE_RUN_TS timestamp_ntz',
                                'ARCHIVE_BATCH_ID varchar'] %}
                 {% do run_query('alter table ' ~ archive_table
                                 ~ ' add column if not exists ' ~ ddl_col) %}
             {% endfor %}
+
+            {# Widen ARCHIVE_DATE on archive tables created earlier as varchar(6) #}
+            {% set len_rows = run_query(
+                    "select character_maximum_length from " ~ tgt_db
+                    ~ ".information_schema.columns where table_schema = '" ~ tgt_schema | upper
+                    ~ "' and table_name = '" ~ archive_table_name
+                    ~ "' and column_name = 'ARCHIVE_DATE'"
+                ).rows %}
+            {% if len_rows | length > 0 and len_rows[0][0] is not none and len_rows[0][0] < 8 %}
+                {{ log('    Widening ' ~ archive_table ~ '.ARCHIVE_DATE to varchar(8)', info=True) }}
+                {% do run_query('alter table ' ~ archive_table
+                                ~ ' alter column ARCHIVE_DATE set data type varchar(8)') %}
+            {% endif %}
 
             {% set archive_insert_sql %}
                 insert into {{ archive_table }}
@@ -173,18 +187,6 @@
                         where a.{{ ts_column }} = s.{{ ts_column }}
                           and a.ARCHIVE_DATE    = '{{ archive_date }}'
                   )
-            {% endset %}
-
-            {% set unload_sql %}
-                copy into {{ archive_stage }}
-                from (
-                    select *
-                    from {{ archive_table }}
-                    where ARCHIVE_BATCH_ID = '{{ archive_batch_id }}'
-                )
-                file_format = (type = parquet compression = snappy)
-                header      = true
-                overwrite   = false
             {% endset %}
 
             {% set delete_sql %}
@@ -208,32 +210,18 @@
                 {% set t.error_msg = 'Archive count mismatch: source=' ~ source_cnt
                                      ~ ', archived=' ~ t.archived_cnt %}
             {% else %}
-
-                {% set unload_rows = run_query(unload_sql).rows %}
-                {% set unloaded_cnt = unload_rows[0][0] if unload_rows | length > 0 else 0 %}
-
-                {% if unloaded_cnt != t.archived_cnt %}
+                {% set deleted_cnt = run_query(delete_sql).rows[0][0] %}
+                {% if deleted_cnt != source_cnt %}
                     {% set t.status    = 'FAILED' %}
-                    {% set t.error_msg = 'Stage unload mismatch: archived=' ~ t.archived_cnt
-                                         ~ ', unloaded=' ~ unloaded_cnt
-                                         ~ ' (path: ' ~ archive_stage ~ ')' %}
-                {% else %}
-
-                    {% set deleted_cnt = run_query(delete_sql).rows[0][0] %}
-
-                    {% if deleted_cnt != source_cnt %}
-                        {% set t.status    = 'FAILED' %}
-                        {% set t.error_msg = 'Delete count mismatch: source=' ~ source_cnt
-                                             ~ ', deleted=' ~ deleted_cnt %}
-                    {% endif %}
-
+                    {% set t.error_msg = 'Delete count mismatch: source=' ~ source_cnt
+                                         ~ ', deleted=' ~ deleted_cnt %}
                 {% endif %}
             {% endif %}
 
             {% if t.status == 'SUCCESS' %}
                 {% do run_query('commit') %}
                 {% set ns.success = ns.success + 1 %}
-                {{ log('    SUCCESS : ' ~ t.archived_cnt ~ ' rows archived, unloaded and deleted', info=True) }}
+                {{ log('    SUCCESS : ' ~ t.archived_cnt ~ ' rows archived and deleted', info=True) }}
             {% else %}
                 {% do run_query('rollback') %}
                 {% set ns.failed = ns.failed + 1 %}
@@ -266,6 +254,26 @@
             ~ '. See ' ~ run_log_table ~ " where ARCHIVE_BATCH_ID = '" ~ archive_batch_id ~ "'") }}
     {% endif %}
 
+{% endmacro %}
+
+
+{#- ----------------------------------------------------------------------
+    Helper: read a required project var, trimmed and upper-cased.
+    The YAML block style ( key: | ) leaves newlines/spaces around the
+    value, so trimming is required. Fails on missing or 'invalid_database'
+    (i.e. target.name is not dev/qa/stg/prd).
+    ---------------------------------------------------------------------- -#}
+{% macro _arch_var(name) %}
+    {% set val = (var(name, '') | string | trim | upper) %}
+    {% if val == '' %}
+        {{ exceptions.raise_compiler_error(
+            "Project var '" ~ name ~ "' is not defined in dbt_project.yml.") }}
+    {% elif val == 'INVALID_DATABASE' %}
+        {{ exceptions.raise_compiler_error(
+            "Var '" ~ name ~ "' resolved to invalid_database for target.name='" ~ target.name
+            ~ "'. Set Target name to dev / qa / stg / prd in your dbt Cloud credentials or environment.") }}
+    {% endif %}
+    {{ return(val) }}
 {% endmacro %}
 
 
@@ -322,3 +330,47 @@
         '{{ val | string | replace("'", "''") }}'
     {%- endif -%}
 {%- endmacro %}
+
+
+create table if not exists EC_FAD_IM_DEV1.METADATA.ARCHIVE_CONFIG
+(
+    CONFIG_ID       number autoincrement start 1 increment 1,
+    DATABASE_NAME   varchar(255),                  -- null = falls back to tgt_database
+    SCHEMA_NAME     varchar(255)  not null,
+    TABLE_NAME      varchar(255)  not null,
+    ACTIVE_FLG      char(1)       default 'Y' not null,   -- 'Y' = include in archive run
+    COMMENTS        varchar(1000),
+    CREATED_BY      varchar(255)  default current_user(),
+    CREATED_TS      timestamp_ntz default current_timestamp(),
+    UPDATED_BY      varchar(255),
+    UPDATED_TS      timestamp_ntz,
+
+    constraint PK_ARCHIVE_CONFIG primary key (CONFIG_ID),
+    constraint UK_ARCHIVE_CONFIG unique (DATABASE_NAME, SCHEMA_NAME, TABLE_NAME)
+)
+comment = 'Tables eligible for archive_historical_records macro';
+
+insert into EC_FAD_IM_DEV1.METADATA.ARCHIVE_CONFIG
+    (DATABASE_NAME, SCHEMA_NAME, TABLE_NAME, ACTIVE_FLG, COMMENTS)
+values
+    (null, 'TARGET_DAL', 'HCP_BOARD_CERTIFICATION', 'Y', 'Provider board certs'),
+    (null, 'TARGET_DAL', 'HCP_ADDRESS',             'N', 'Onboard later');
+
+
+dbt clean
+dbt deps
+
+dbt compile --inline "{{ target.name }} | {{ var('tgt_database') | trim }}.{{ var('tgt_schema') }} | {{ var('recon_database') | trim }}.{{ var('recon_schema') }}"
+
+# one table
+dbt run-operation archive_historical_records --args '{"archive_date": "20200101", "table_name": "HCP_BOARD_CERTIFICATION", "dry_run": true}'
+
+# all active tables
+dbt run-operation archive_historical_records --args '{"archive_date": "20200101", "dry_run": true}'
+
+# one table
+dbt run-operation archive_historical_records --args '{"archive_date": "20200101", "table_name": "HCP_BOARD_CERTIFICATION"}'
+
+# all active tables in ARCHIVE_CONFIG
+dbt run-operation archive_historical_records --args '{"archive_date": "20200101"}'
+
