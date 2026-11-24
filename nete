@@ -1,0 +1,22 @@
+WITH src_list AS (
+    SELECT 'NDW_ZIP_CODE_1214' AS nm
+    UNION ALL SELECT 'BCBSA_PI_042_CH'
+    UNION ALL SELECT 'BCBSA_PI_042_CL'
+    UNION ALL SELECT 'ERR_CENSUS_REF_SDOH_GEOGRAPHY'
+    UNION ALL SELECT 'ERR_DHCS_CCS_MCP'
+    UNION ALL SELECT 'ERR_LA_CARE_CCS_MCP'
+    UNION ALL SELECT 'NDW_MMI_MEMBER_DTL'
+    UNION ALL SELECT 'CMS_PART_C_MODEL_OUTPUT_REPORT_DTL_TYPE_CF'
+    -- ...add the rest of the list
+)
+SELECT  s.nm          AS excel_name,
+        o.OBJNAME     AS actual_table,
+        o.OBJTYPE,
+        o.CREATEDATE
+FROM    src_list s
+LEFT JOIN _V_OBJECT_DATA o
+       ON  o.DBNAME = 'RAWSTG_SRC_P1'
+       AND o.SCHEMA = 'NZ_SCRM'
+       AND o.OBJTYPE IN ('TABLE', 'VIEW')
+       AND POSITION(s.nm IN o.OBJNAME) > 0   -- substring match
+ORDER BY s.nm, o.OBJNAME;
