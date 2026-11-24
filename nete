@@ -130,10 +130,7 @@ SELECT  s.nm        AS excel_name,
           || 'COUNT(*) AS row_cnt, COUNT(DISTINCT xid) AS load_txns '
           || 'FROM (SELECT CREATEXID + 0 AS xid FROM RAWSTG_SRC_P1.NZ_SCRM.'
           || o.OBJNAME || ') a'
-          || CASE WHEN ROW_NUMBER() OVER (
-                        PARTITION BY CASE WHEN o.OBJNAME IS NULL THEN 1 ELSE 0 END
-                        ORDER BY o.OBJNAME DESC, s.nm DESC) = 1
-                  THEN ';' ELSE ' UNION ALL' END      AS count_sql
+          || ' UNION ALL'  AS count_sql
 FROM    src_list s
 LEFT JOIN _V_OBJECT_DATA o
        ON  o.DBNAME  = 'RAWSTG_SRC_P1'
