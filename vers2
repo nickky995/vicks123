@@ -1,0 +1,427 @@
+{#- ======================================================================
+    archive_historical_records
+    ----------------------------------------------------------------------
+    For each active table in the archive config:
+      1. Copies rows in the archive window into
+         <tgt_database>.<tgt_schema>.<table>_ARCHIVE
+      2. Validates the archived count
+      3. Deletes those rows from the source table
+    Before step 1, a read-only structure check confirms both tables exist and
+    the archive table = source columns (same order) + ARCHIVE_DATE,
+    ARCHIVE_RUN_TS, ARCHIVE_BATCH_ID.
+    Steps 1-3 run in one Snowflake Scripting block per table with an
+    EXCEPTION handler: a count mismatch OR a SQL error rolls back that table,
+    is logged as FAILED, and the run continues with the next table.
+    Every table gets a row in <recon_database>.<recon_schema>.ARCHIVE_RUN_LOG.
+    Archive tables are pre-created; this macro runs no DDL.
+
+    Environment-agnostic: database/schema names come from the consuming
+    project's dbt_project.yml vars (already resolved per target.name):
+      tgt_database, tgt_schema        -> archive tables
+      recon_database, recon_schema    -> ARCHIVE_CONFIG and ARCHIVE_RUN_LOG
+    (config_table arg can still override the config location for one run)
+
+    archive_date: YYYYMMDD - the archive window starts on that day
+
+    archive_date source (first one set wins):
+      --args '{"archive_date": "..."}'  >  --vars '{"archive_date": "..."}'  >  env var DBT_ARCHIVE_DATE
+
+    Usage:
+      dbt run-operation archive_historical_records --args '{"archive_date": "20200101"}'
+      dbt run-operation archive_historical_records --vars '{"archive_date": "20200101"}'
+      dbt run-operation archive_historical_records          # uses DBT_ARCHIVE_DATE
+      dbt run-operation archive_historical_records --args '{"archive_date": "20200101", "table_name": "HCP_BOARD_CERTIFICATION"}'
+      dbt run-operation archive_historical_records --args '{"archive_date": "20200101", "dry_run": true}'
+    ====================================================================== -#}
+
+{% macro archive_historical_records(
+        archive_date=none,
+        config_table=none,
+        table_name=none,
+        months_to_archive=60,
+        ts_column='INSRT_TS',
+        dry_run=false
+    ) %}
+
+    {#----------------------------------------------------------------------#}
+    {# 1. Validate input                                                    #}
+    {#----------------------------------------------------------------------#}
+
+    {# Resolve date: --args  >  --vars  >  env var DBT_ARCHIVE_DATE #}
+    {% set archive_date = archive_date
+                          or var('archive_date', none)
+                          or env_var('DBT_ARCHIVE_DATE', '') %}
+    {% if not archive_date %}
+        {{ exceptions.raise_compiler_error(
+            "archive_date not provided. Pass it via --args, --vars, or env var DBT_ARCHIVE_DATE (YYYYMMDD).") }}
+    {% endif %}
+    {% set archive_date = archive_date | string | trim %}
+    {% if not modules.re.match('^[0-9]{4}(0[1-9]|1[0-2])(0[1-9]|[12][0-9]|3[01])$', archive_date) %}
+        {{ exceptions.raise_compiler_error(
+            "archive_date must be YYYYMMDD (e.g. 20200115), got: '" ~ archive_date ~ "'") }}
+    {% endif %}
+    {# reject impossible dates like 20230231 #}
+    {% set _ = modules.datetime.datetime.strptime(archive_date, '%Y%m%d') %}
+
+    {#----------------------------------------------------------------------#}
+    {# 2. Environment-specific names from project vars                      #}
+    {#----------------------------------------------------------------------#}
+
+    {% set tgt_db      = _arch_var('tgt_database') %}
+    {% set tgt_schema  = _arch_var('tgt_schema') %}
+    {% set recon_db    = _arch_var('recon_database') %}
+    {% set recon_schema = _arch_var('recon_schema') %}
+
+    {# Both control tables live in the recon database/schema #}
+    {% set config_table  = config_table or (recon_db ~ '.' ~ recon_schema ~ '.ARCHIVE_CONFIG') %}
+    {% set run_log_table = recon_db ~ '.' ~ recon_schema ~ '.ARCHIVE_RUN_LOG' %}
+
+    {# Guard: never send "from  where ..." to Snowflake #}
+    {% if config_table is none or (config_table | string | trim) == ''
+          or (config_table | string).startswith('.') %}
+        {{ exceptions.raise_compiler_error(
+            "config_table resolved to '" ~ config_table ~ "'. Check vars recon_database='"
+            ~ recon_db ~ "' and recon_schema='" ~ recon_schema
+            ~ "' for target.name='" ~ target.name ~ "', or pass config_table in --args.") }}
+    {% endif %}
+
+    {#----------------------------------------------------------------------#}
+    {# 3. Batch ID + archive window                                         #}
+    {#    [start, least(start + N months, first day of current month))      #}
+    {#    Never touches the current month.                                  #}
+    {#----------------------------------------------------------------------#}
+
+    {% set archive_batch_id =
+            archive_date ~ '_'
+         ~ modules.datetime.datetime.now().strftime('%Y%m%d%H%M%S') ~ '_'
+         ~ invocation_id[:8] %}
+
+    {% set start_dt_sql = "to_date('" ~ archive_date ~ "', 'YYYYMMDD')" %}
+    {% set end_excl_sql =
+            "least(add_months(" ~ start_dt_sql ~ ", " ~ months_to_archive ~ "), "
+         ~ "date_trunc('month', current_date()))" %}
+
+    {% set range_filter %}
+        {{ ts_column }} >= {{ start_dt_sql }}
+    and {{ ts_column }} <  {{ end_excl_sql }}
+    {% endset %}
+
+    {{ log('==================================================================', info=True) }}
+    {{ log('Archive run    : ' ~ archive_batch_id ~ (' [DRY RUN]' if dry_run else ''), info=True) }}
+    {{ log('Target name    : ' ~ target.name, info=True) }}
+    {{ log('Config table   : ' ~ config_table, info=True) }}
+    {{ log('Archive tables : ' ~ tgt_db ~ '.' ~ tgt_schema ~ '.<table>_ARCHIVE', info=True) }}
+    {{ log('Run log table  : ' ~ run_log_table, info=True) }}
+    {{ log('==================================================================', info=True) }}
+
+    {#----------------------------------------------------------------------#}
+    {# 4. Read config                                                       #}
+    {#----------------------------------------------------------------------#}
+
+    {% set config_sql %}
+        select
+            coalesce(database_name, '{{ tgt_db }}') as database_name,
+            schema_name,
+            table_name
+        from {{ config_table }}
+        where active_flg = 'Y'
+        {% if table_name %}
+          and upper(table_name) = upper({{ _arch_str(table_name) }})
+        {% endif %}
+        order by table_name
+    {% endset %}
+
+    {% set config_rows = run_query(config_sql).rows %}
+
+    {% if config_rows | length == 0 %}
+        {{ log('No active tables found in ' ~ config_table
+               ~ (' for ' ~ table_name if table_name else '') ~ '. Nothing to do.', info=True) }}
+        {{ return(none) }}
+    {% endif %}
+
+    {% set ns = namespace(success=0, no_data=0, failed=0, failed_tables=[]) %}
+
+    {#----------------------------------------------------------------------#}
+    {# 5. Process each table                                                #}
+    {#----------------------------------------------------------------------#}
+
+    {% for row in config_rows %}
+
+        {% set database_name = row[0] | upper %}
+        {% set schema_name   = row[1] | upper %}
+        {% set source_table  = row[2] | upper %}
+
+        {% set src_table          = database_name ~ '.' ~ schema_name ~ '.' ~ source_table %}
+        {% set archive_table_name = source_table ~ '_ARCHIVE' %}
+        {% set archive_table      = tgt_db ~ '.' ~ tgt_schema ~ '.' ~ archive_table_name %}
+
+        {{ log('[' ~ loop.index ~ '/' ~ loop.length ~ '] ' ~ src_table ~ '  ->  ' ~ archive_table, info=True) }}
+
+        {#------------------------------------------------------------------#}
+        {# 5a. Structure pre-check (read-only):                             #}
+        {#     - source and archive tables exist                            #}
+        {#     - archive = source columns in the same order                 #}
+        {#                 + ARCHIVE_DATE, ARCHIVE_RUN_TS, ARCHIVE_BATCH_ID   #}
+        {#------------------------------------------------------------------#}
+        {% set struct_sql %}
+            with s as (
+                select column_name, ordinal_position
+                from {{ database_name }}.information_schema.columns
+                where table_schema = '{{ schema_name }}' and table_name = '{{ source_table }}'
+            ),
+            a as (
+                select column_name, ordinal_position
+                from {{ tgt_db }}.information_schema.columns
+                where table_schema = '{{ tgt_schema }}' and table_name = '{{ archive_table_name }}'
+            ),
+            n as (select count(*) as c from s)
+            select
+                (select c from n)                                          as src_cols,
+                (select count(*) from a)                                   as arc_cols,
+                (select count(*) from s join a
+                    on s.ordinal_position = a.ordinal_position
+                   and s.column_name      = a.column_name)                 as matched_cols,
+                (select coalesce(listagg(column_name, ',')
+                        within group (order by ordinal_position), '')
+                   from a where ordinal_position > (select c from n))      as extra_cols,
+                (select left(coalesce(listagg(
+                            '#' || coalesce(s.ordinal_position, a.ordinal_position) || ' '
+                            || coalesce(s.column_name, '<none>') || ' vs '
+                            || coalesce(a.column_name, '<none>'), ', ')
+                        within group (order by coalesce(s.ordinal_position, a.ordinal_position)), ''), 500)
+                   from s full outer join a on s.ordinal_position = a.ordinal_position
+                   where coalesce(s.ordinal_position, a.ordinal_position) <= (select c from n)
+                     and (s.column_name is distinct from a.column_name))   as mismatches
+        {% endset %}
+
+        {% set st = run_query(struct_sql).rows[0] %}
+        {% set src_cols = st[0] %}
+        {% set arc_cols = st[1] %}
+        {% set matched  = st[2] %}
+        {% set extra    = st[3] %}
+        {% set mism     = st[4] %}
+
+        {% set struct_err = none %}
+        {% if src_cols == 0 %}
+            {% set struct_err = 'Source table ' ~ src_table ~ ' not found (or no access)' %}
+        {% elif arc_cols == 0 %}
+            {% set struct_err = 'Archive table ' ~ archive_table ~ ' not found (or no access)' %}
+        {% elif matched != src_cols %}
+            {% set struct_err = 'Column order/name mismatch vs source: ' ~ mism %}
+        {% elif extra != 'ARCHIVE_DATE,ARCHIVE_RUN_TS,ARCHIVE_BATCH_ID' %}
+            {% set struct_err = 'Archive table must end with ARCHIVE_DATE,ARCHIVE_RUN_TS,ARCHIVE_BATCH_ID; found: ' ~ (extra or '<none>') %}
+        {% endif %}
+
+        {% if struct_err %}
+
+            {{ log('    FAILED  : ' ~ struct_err, info=True) }}
+            {% set ns.failed = ns.failed + 1 %}
+            {% do ns.failed_tables.append(src_table) %}
+            {% do _log_archive_run(run_log_table, database_name, schema_name, source_table,
+                                   archive_date, archive_batch_id, 0, 'FAILED', struct_err, dry_run) %}
+
+        {% else %}
+
+            {# ---- Count rows in archive window ---- #}
+            {% set source_cnt = run_query(
+                    "select count(*) from " ~ src_table ~ " where " ~ range_filter
+                ).rows[0][0] %}
+
+            {{ log('    Rows in window : ' ~ source_cnt, info=True) }}
+
+            {% if source_cnt == 0 %}
+
+                {% do _log_archive_run(run_log_table, database_name, schema_name, source_table,
+                                       archive_date, archive_batch_id, 0, 'NO_DATA', none, dry_run) %}
+                {% set ns.no_data = ns.no_data + 1 %}
+
+            {% elif dry_run %}
+
+                {{ log('    [DRY RUN] structure OK; would archive and delete ' ~ source_cnt ~ ' rows', info=True) }}
+
+            {% else %}
+
+                {#----------------------------------------------------------#}
+                {# 5b. Archive + validate + delete in one Snowflake         #}
+                {#     Scripting block. Any SQL error is caught by the      #}
+                {#     EXCEPTION handler, rolled back, and returned as text #}
+                {#     so the macro logs it and moves to the next table.    #}
+                {#     Returns: STATUS|ROWS|MESSAGE                         #}
+                {#----------------------------------------------------------#}
+                {% set archive_block %}
+execute immediate $$
+declare
+    v_src       integer default 0;
+    v_archived  integer default 0;
+    v_deleted   integer default 0;
+begin
+    begin transaction;
+
+    -- recount inside the transaction so insert/delete validate against the same snapshot
+    select count(*) into :v_src
+    from {{ src_table }}
+    where {{ ts_column }} >= {{ start_dt_sql }}
+      and {{ ts_column }} <  {{ end_excl_sql }};
+
+    insert into {{ archive_table }}
+    select
+        s.*,
+        '{{ archive_date }}',
+        current_timestamp(),
+        '{{ archive_batch_id }}'
+    from {{ src_table }} s
+    where s.{{ ts_column }} >= {{ start_dt_sql }}
+      and s.{{ ts_column }} <  {{ end_excl_sql }}
+      and not exists (
+            select 1
+            from {{ archive_table }} a
+            where a.{{ ts_column }} = s.{{ ts_column }}
+              and a.ARCHIVE_DATE    = '{{ archive_date }}'
+      );
+    v_archived := SQLROWCOUNT;
+
+    if (v_archived != v_src) then
+        rollback;
+        return 'FAILED|0|Archive count mismatch: source=' || v_src || ', archived=' || v_archived;
+    end if;
+
+    delete from {{ src_table }}
+    where {{ ts_column }} >= {{ start_dt_sql }}
+      and {{ ts_column }} <  {{ end_excl_sql }};
+    v_deleted := SQLROWCOUNT;
+
+    if (v_deleted != v_src) then
+        rollback;
+        return 'FAILED|0|Delete count mismatch: source=' || v_src || ', deleted=' || v_deleted;
+    end if;
+
+    commit;
+    return 'SUCCESS|' || v_archived || '|';
+
+exception
+    when other then
+        rollback;
+        return 'FAILED|0|SQL error ' || sqlcode || ' (' || sqlstate || '): ' || sqlerrm;
+end;
+$$
+                {% endset %}
+
+                {% set result_txt = run_query(archive_block).rows[0][0] | string %}
+                {% set parts = result_txt.split('|', 2) %}
+                {% set t_status   = parts[0] %}
+                {% set t_rows     = (parts[1] if parts | length > 1 else 0) | int %}
+                {% set t_msg      = (parts[2] if parts | length > 2 else '') | trim %}
+
+                {% if t_status == 'SUCCESS' %}
+                    {% set ns.success = ns.success + 1 %}
+                    {{ log('    SUCCESS : ' ~ t_rows ~ ' rows archived and deleted', info=True) }}
+                {% else %}
+                    {% set t_status = 'FAILED' %}
+                    {% set t_msg = t_msg or ('Unexpected block result: ' ~ result_txt) %}
+                    {% set ns.failed = ns.failed + 1 %}
+                    {% do ns.failed_tables.append(src_table) %}
+                    {{ log('    FAILED  : ' ~ t_msg, info=True) }}
+                {% endif %}
+
+                {% do _log_archive_run(run_log_table, database_name, schema_name, source_table,
+                                       archive_date, archive_batch_id,
+                                       t_rows if t_status == 'SUCCESS' else 0,
+                                       t_status, (t_msg or none), dry_run) %}
+
+            {% endif %}
+
+        {% endif %}
+
+    {% endfor %}
+
+    {#----------------------------------------------------------------------#}
+    {# 6. Summary - fail the job if any table failed                        #}
+    {#----------------------------------------------------------------------#}
+
+    {{ log('==================================================================', info=True) }}
+    {{ log('Summary  -> success: ' ~ ns.success ~ ' | no_data: ' ~ ns.no_data
+           ~ ' | failed: ' ~ ns.failed, info=True) }}
+    {{ log('==================================================================', info=True) }}
+
+    {% if ns.failed > 0 %}
+        {{ exceptions.raise_compiler_error(
+            'Archive failed for ' ~ ns.failed ~ ' table(s): ' ~ (ns.failed_tables | join(', '))
+            ~ '. See ' ~ run_log_table ~ " where ARCHIVE_BATCH_ID = '" ~ archive_batch_id ~ "'") }}
+    {% endif %}
+
+{% endmacro %}
+
+
+{#- ----------------------------------------------------------------------
+    Helper: read a required project var, trimmed and upper-cased.
+    The YAML block style ( key: | ) leaves newlines/spaces around the
+    value, so trimming is required. Fails on missing or 'invalid_database'
+    (i.e. target.name is not dev/qa/stg/prd).
+    ---------------------------------------------------------------------- -#}
+{% macro _arch_var(name) %}
+    {% set val = (var(name, '') | string | trim | upper) %}
+    {% if val == '' %}
+        {{ exceptions.raise_compiler_error(
+            "Project var '" ~ name ~ "' is not defined in dbt_project.yml.") }}
+    {% elif val == 'INVALID_DATABASE' %}
+        {{ exceptions.raise_compiler_error(
+            "Var '" ~ name ~ "' resolved to invalid_database for target.name='" ~ target.name
+            ~ "'. Set Target name to dev / qa / stg / prd in your dbt Cloud credentials or environment.") }}
+    {% endif %}
+    {{ return(val) }}
+{% endmacro %}
+
+
+{#- ----------------------------------------------------------------------
+    Helper: write one row to ARCHIVE_RUN_LOG (skipped on dry run)
+    ---------------------------------------------------------------------- -#}
+{% macro _log_archive_run(run_log_table, database_name, schema_name, table_name,
+                          archive_date, archive_batch_id, rows_archived,
+                          status, error_msg=none, dry_run=false) %}
+
+    {% if dry_run %}
+        {{ return(none) }}
+    {% endif %}
+
+    {% set audit_sql %}
+        insert into {{ run_log_table }}
+        (
+            RUN_TS,
+            DATABASE_NAME,
+            SCHEMA_NAME,
+            TABLE_NAME,
+            ARCHIVE_DATE,
+            ARCHIVE_BATCH_ID,
+            ROWS_ARCHIVED,
+            STATUS,
+            ERROR_MESSAGE
+        )
+        values
+        (
+            current_timestamp(),
+            {{ _arch_str(database_name) }},
+            {{ _arch_str(schema_name) }},
+            {{ _arch_str(table_name) }},
+            {{ _arch_str(archive_date) }},
+            {{ _arch_str(archive_batch_id) }},
+            {{ rows_archived | int }},
+            {{ _arch_str(status) }},
+            {{ _arch_str(error_msg) }}
+        )
+    {% endset %}
+
+    {% do run_query(audit_sql) %}
+
+{% endmacro %}
+
+
+{#- ----------------------------------------------------------------------
+    Helper: render a value as a safe SQL string literal (or null)
+    ---------------------------------------------------------------------- -#}
+{% macro _arch_str(val) -%}
+    {%- if val is none or (val | string | trim) == '' -%}
+        null
+    {%- else -%}
+        '{{ val | string | replace("'", "''") }}'
+    {%- endif -%}
+{%- endmacro %}
