@@ -92,3 +92,50 @@ DESC TABLE MY_DB.ARCHIVE_SCHEMA.STATE_ARCH;
 SELECT COLUMN_NAME, TAG_NAME, TAG_VALUE
 FROM TABLE(MY_DB.INFORMATION_SCHEMA.TAG_REFERENCES_ALL_COLUMNS(
        'MY_DB.ARCHIVE_SCHEMA.STATE_ARCH', 'table'));
+
+
+
+CREATE OR REPLACE PROCEDURE GENERATE_ARCHIVE_DDLS(
+    TGT_SCHEMA VARCHAR,                    -- schema holding archive tables, UPPERCASE
+    SUFFIX     VARCHAR DEFAULT '_ARCHIVE'  -- table name ending to match
+)
+RETURNS VARCHAR
+LANGUAGE SQL
+EXECUTE AS CALLER
+AS
+$$
+DECLARE
+  fq     VARCHAR;
+  ddl    VARCHAR;
+  script VARCHAR DEFAULT '';
+  n      INTEGER DEFAULT 0;
+  rs     RESULTSET;
+BEGIN
+  rs := (SELECT TABLE_NAME
+         FROM INFORMATION_SCHEMA.TABLES
+         WHERE TABLE_SCHEMA = :TGT_SCHEMA
+           AND TABLE_TYPE  = 'BASE TABLE'
+           AND ENDSWITH(TABLE_NAME, :SUFFIX)
+         ORDER BY TABLE_NAME);
+  LET c CURSOR FOR rs;
+
+  FOR t IN c DO
+    fq := TGT_SCHEMA || '."' || t.TABLE_NAME || '"';   -- no DB name: portable across envs
+    SELECT GET_DDL('TABLE', :fq) INTO :ddl;
+
+    -- Safe for target env: never replace existing tables
+    ddl := REPLACE(ddl, 'create or replace TABLE', 'CREATE TABLE IF NOT EXISTS');
+    ddl := REPLACE(ddl, 'create or replace table', 'CREATE TABLE IF NOT EXISTS');
+
+    script := script || '-- ' || t.TABLE_NAME || CHR(10) || ddl || CHR(10) || CHR(10);
+    n := n + 1;
+  END FOR;
+
+  RETURN '-- ' || n || ' archive tables' || CHR(10) || CHR(10) || script;
+END;
+$$;
+
+
+
+USE DATABASE MY_DB;
+CALL GENERATE_ARCHIVE_DDLS('ARCHIVE_SCHEMA', '_ARCHIVE');
